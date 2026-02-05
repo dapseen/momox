@@ -22,7 +22,7 @@ All GCP resources that support labels MUST have the following labels applied:
 
 | Label Key | Description | Valid Values | Example |
 |-----------|-------------|--------------|---------|
-| `owner` | Email or team name responsible for the resource | Email address or team name | `platform-team@company.com` |
+| `owner` | Email or team name responsible for the resource | Email address or team name | `platform-team@momox.com` |
 | `environment` | Deployment environment | `dev`, `staging`, `prod`, `sandbox`, `test` | `prod` |
 | `cost-center` | Financial cost allocation code | Cost center codes as defined by Finance | `CC-1234` |
 | `team` | Team that manages this resource | Team names from org chart | `platform`, `data`, `backend` |

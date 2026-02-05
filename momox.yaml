@@ -1,0 +1,20 @@
+agents:
+  root:
+    model: openai/gpt-5-mini
+    description: "Github Agent - Help to read the Infra repo using MCP tools"
+    instruction: |
+      You are a helpful assistant that understand terraform infra code and help to read the code using MCP tools
+    tooolsets:
+      - type: mcp
+        ref: docker:github-offical
+        instruction: |
+          {ORIGINAL_INSTRUCTIONS}
+          Read the infra repo and help to understand the code and help to read the code using MCP tools
+    commands:
+      - whoami: "Which user is currently logged in?"
+
+  models:
+    openai:
+      provider: openai
+      model: gpt-5-mini
+      max_tokens: 1000

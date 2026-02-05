@@ -1,0 +1,291 @@
+name: Terraform PR Risk Assessment
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '**.tfvars.json'
+      - 'modules/**'
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  OPA_VERSION: '0.61.0'
+  # POC: uses examples/sample-tfplan.json instead of live terraform plan (no GCP credentials needed)
+
+jobs:
+  # Job 1: Determine if we should run based on trigger
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            # Check if comment is on a PR and contains /review
+            if [[ "${{ github.event.issue.pull_request }}" != "" ]] && \
+               [[ "${{ contains(github.event.comment.body, '/review') }}" == "true" ]]; then
+              echo "should_run=true" >> $GITHUB_OUTPUT
+              echo "pr_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            else
+              echo "should_run=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  # Job 2: Use sample Terraform plan (POC - no live infra)
+  terraform-plan:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use sample Terraform plan
+        run: |
+          cp examples/sample-tfplan.json tfplan.json
+          echo "Using sample plan from examples/sample-tfplan.json (POC mode)"
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: tfplan.json
+          retention-days: 7
+
+  # Job 3: Run OPA Policy Checks
+  opa-validation:
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    outputs:
+      violations: ${{ steps.opa.outputs.violations }}
+      warnings: ${{ steps.opa.outputs.warnings }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Run OPA Policy Evaluation
+        id: opa
+        run: |
+          # Run deny policies
+          echo "Running OPA policy checks..."
+          
+          # Evaluate deny rules
+          opa eval \
+            --input tfplan.json \
+            --data policies/ \
+            --format json \
+            "data.terraform.validation.deny" > opa-deny-results.json
+          
+          # Evaluate warn rules
+          opa eval \
+            --input tfplan.json \
+            --data policies/ \
+            --format json \
+            "data.terraform.validation.warn" > opa-warn-results.json
+          
+          # Count violations and warnings
+          violations=$(jq '.result[0].expressions[0].value | length' opa-deny-results.json)
+          warnings=$(jq '.result[0].expressions[0].value | length' opa-warn-results.json)
+          
+          echo "violations=$violations" >> $GITHUB_OUTPUT
+          echo "warnings=$warnings" >> $GITHUB_OUTPUT
+          
+          echo "Found $violations violations and $warnings warnings"
+          
+          # Create combined results
+          jq -s '{ 
+            violations: .[0].result[0].expressions[0].value, 
+            warnings: .[1].result[0].expressions[0].value 
+          }' opa-deny-results.json opa-warn-results.json > opa-results.json
+
+      - name: Upload OPA Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: opa-results
+          path: opa-results.json
+          retention-days: 7
+
+  # Job 4: Run AI Risk Assessment with Cagent
+  risk-assessment:
+    needs: [check-trigger, terraform-plan, opa-validation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+
+      - name: Download OPA Results
+        uses: actions/download-artifact@v4
+        with:
+          name: opa-results
+
+      - name: Add eyes reaction to comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -X POST -f content='eyes' || true
+
+      - name: Get PR Information
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+        run: |
+          gh pr view $PR_NUMBER --json title,body,author,labels,files,additions,deletions > pr-info.json
+          
+          # Extract info for prompt
+          title=$(jq -r '.title' pr-info.json)
+          author=$(jq -r '.author.login' pr-info.json)
+          files_count=$(jq '.files | length' pr-info.json)
+          additions=$(jq -r '.additions' pr-info.json)
+          deletions=$(jq -r '.deletions' pr-info.json)
+          labels=$(jq -r '.labels[].name' pr-info.json | tr '\n' ', ' | sed 's/,$//')
+          
+          echo "title=$title" >> $GITHUB_OUTPUT
+          echo "author=$author" >> $GITHUB_OUTPUT
+          echo "files_count=$files_count" >> $GITHUB_OUTPUT
+          echo "additions=$additions" >> $GITHUB_OUTPUT
+          echo "deletions=$deletions" >> $GITHUB_OUTPUT
+          echo "labels=$labels" >> $GITHUB_OUTPUT
+
+      - name: Build Review Prompt
+        id: prompt
+        env:
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          OPA_VIOLATIONS: ${{ needs.opa-validation.outputs.violations }}
+          OPA_WARNINGS: ${{ needs.opa-validation.outputs.warnings }}
+        run: |
+          cat > review-prompt.md << 'EOF'
+          # Terraform PR Risk Assessment Request
+
+          ## PR Information
+          - **Repository**: ${{ github.repository }}
+          - **PR Number**: ${PR_NUMBER}
+          - **Title**: ${{ steps.pr-info.outputs.title }}
+          - **Author**: ${{ steps.pr-info.outputs.author }}
+          - **Files Changed**: ${{ steps.pr-info.outputs.files_count }}
+          - **Additions**: ${{ steps.pr-info.outputs.additions }}
+          - **Deletions**: ${{ steps.pr-info.outputs.deletions }}
+          - **Labels**: ${{ steps.pr-info.outputs.labels }}
+
+          ## Pre-computed Results
+
+          ### OPA Policy Results
+          - **Violations**: ${OPA_VIOLATIONS}
+          - **Warnings**: ${OPA_WARNINGS}
+
+          The detailed OPA results are in `opa-results.json`.
+          The Terraform plan JSON is in `tfplan.json`.
+
+          ## Instructions
+
+          1. Read the Terraform plan JSON to understand what resources are being created/modified/deleted
+          2. Review the OPA policy violations and warnings
+          3. Use the Terraform MCP tools to look up documentation for the resources being changed
+          4. Use the GCP MCP tools to check for GCP-specific security best practices
+          5. Check company policies using the RAG knowledge base
+          6. Aggregate all findings into a comprehensive risk assessment
+          7. Post a summary comment on the PR using the GitHub MCP tools
+
+          Focus on actionable findings that platform engineers need to address.
+          EOF
+
+      - name: Run Cagent Risk Assessment
+        id: cagent
+        uses: docker/cagent-action@latest
+        with:
+          agent: ./agents/terraform-pr-assistant.yaml
+          prompt: |
+            $(cat review-prompt.md)
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mcp-gateway: true
+          timeout: 600
+          yolo: true
+          debug: ${{ runner.debug == '1' }}
+
+      - name: Add completion reaction
+        if: github.event_name == 'issue_comment' && success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -X POST -f content='+1' || true
+
+      - name: Add error reaction
+        if: github.event_name == 'issue_comment' && failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -X POST -f content='confused' || true
+
+      - name: Upload Assessment Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assessment-results
+          path: |
+            ${{ steps.cagent.outputs.output-file }}
+            review-prompt.md
+          retention-days: 30
+
+  # Job 5: Summary and Status Check
+  summary:
+    needs: [check-trigger, opa-validation, risk-assessment]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Summary
+        run: |
+          echo "## Terraform PR Risk Assessment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # OPA Results
+          echo "### OPA Policy Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Violations**: ${{ needs.opa-validation.outputs.violations }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Warnings**: ${{ needs.opa-validation.outputs.warnings }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Status
+          if [[ "${{ needs.risk-assessment.result }}" == "success" ]]; then
+            echo "### Status: ✅ Assessment Complete" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Status: ❌ Assessment Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail if violations found
+        if: needs.opa-validation.outputs.violations != '0'
+        run: |
+          echo "::error::OPA policy violations found. See PR comment for details."
+          exit 1

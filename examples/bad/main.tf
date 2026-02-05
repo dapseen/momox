@@ -48,7 +48,7 @@ resource "google_storage_bucket" "Public_Data" {  # VIOLATION: Uppercase in name
 # VIOLATION: Compute instance with security issues
 # ============================================================================
 resource "google_compute_instance" "web_server" {  # VIOLATION: Underscore in name
-  name         = "WebServer01"  # VIOLATION: Uppercase, doesn't follow pattern
+  name         = "WebServer014556"  # VIOLATION: Uppercase, doesn't follow pattern
   machine_type = "e2-medium"
   zone         = "us-central1-a"
   

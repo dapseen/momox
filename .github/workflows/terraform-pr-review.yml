@@ -234,6 +234,19 @@ jobs:
           yolo: true
           debug: ${{ runner.debug == '1' }}
 
+      - name: Post assessment as PR comment
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.MOMOX_TOKEN }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+        run: |
+          if [ -f "${{ steps.cagent.outputs.output-file }}" ]; then
+            gh pr comment $PR_NUMBER --body-file "${{ steps.cagent.outputs.output-file }}"
+            echo "Posted assessment to PR #$PR_NUMBER"
+          else
+            echo "::warning::No output file from cagent, skipping PR comment"
+          fi
+
       - name: Add completion reaction
         if: github.event_name == 'issue_comment' && success()
         env:
